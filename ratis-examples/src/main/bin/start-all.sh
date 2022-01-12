@@ -33,7 +33,11 @@ subcommand="$1"
 shift
 
 # Find a tmpdir, defaulting to what the environment tells us
-tmp="${TMPDIR:-/tmp}"
+# tmp="${TMPDIR:-/tmp}"
+# for example filestore
+# tmp="/tmp/ratis/filestore"
+# for example arithmetics
+tmp="/tmp/ratis/arithmetic"
 
 echo "Starting 3 Ratis servers with '${example}' with directories in '${tmp}' as local storage"
 
