@@ -24,9 +24,12 @@ import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.datastream.impl.DataStreamReplyByteBuffer;
 import org.apache.ratis.netty.NettyConfigKeys;
 import org.apache.ratis.netty.NettyDataStreamUtils;
+import org.apache.ratis.netty.NettyUtils;
+import org.apache.ratis.netty.metrics.NettyServerStreamRpcMetrics;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftPeer;
+import org.apache.ratis.security.TlsConf;
 import org.apache.ratis.server.DataStreamServerRpc;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
@@ -40,16 +43,20 @@ import org.apache.ratis.thirdparty.io.netty.channel.ChannelInitializer;
 import org.apache.ratis.thirdparty.io.netty.channel.ChannelOption;
 import org.apache.ratis.thirdparty.io.netty.channel.ChannelPipeline;
 import org.apache.ratis.thirdparty.io.netty.channel.EventLoopGroup;
-import org.apache.ratis.thirdparty.io.netty.channel.nio.NioEventLoopGroup;
+import org.apache.ratis.thirdparty.io.netty.channel.epoll.EpollEventLoopGroup;
+import org.apache.ratis.thirdparty.io.netty.channel.epoll.EpollServerSocketChannel;
 import org.apache.ratis.thirdparty.io.netty.channel.socket.SocketChannel;
 import org.apache.ratis.thirdparty.io.netty.channel.socket.nio.NioServerSocketChannel;
 import org.apache.ratis.thirdparty.io.netty.handler.codec.ByteToMessageDecoder;
 import org.apache.ratis.thirdparty.io.netty.handler.codec.MessageToMessageEncoder;
 import org.apache.ratis.thirdparty.io.netty.handler.logging.LogLevel;
 import org.apache.ratis.thirdparty.io.netty.handler.logging.LoggingHandler;
+import org.apache.ratis.thirdparty.io.netty.handler.ssl.SslContext;
+import org.apache.ratis.util.ConcurrentUtils;
 import org.apache.ratis.util.JavaUtils;
 import org.apache.ratis.util.PeerProxyMap;
 import org.apache.ratis.util.Preconditions;
+import org.apache.ratis.util.TimeDuration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -95,8 +102,9 @@ public class NettyServerStreamRpc implements DataStreamServerRpc {
         throws IOException {
       for (RaftPeer peer : peers) {
         try {
-          outs.add((DataStreamOutputRpc) map.getProxy(peer.getId()).stream(request));
+          outs.add((DataStreamOutputRpc) map.computeIfAbsent(peer).get().stream(request));
         } catch (IOException e) {
+          map.handleException(peer.getId(), e, true);
           throw new IOException(map.getName() + ": Failed to getDataStreamOutput for " + peer, e);
         }
       }
@@ -108,16 +116,19 @@ public class NettyServerStreamRpc implements DataStreamServerRpc {
   }
 
   private final String name;
-  private final EventLoopGroup bossGroup = new NioEventLoopGroup();
-  private final EventLoopGroup workerGroup = new NioEventLoopGroup();
+  private final EventLoopGroup bossGroup;
+  private final EventLoopGroup workerGroup;
   private final ChannelFuture channelFuture;
 
   private final DataStreamManagement requests;
   private final List<Proxies> proxies = new ArrayList<>();
 
-  public NettyServerStreamRpc(RaftServer server) {
+  private final NettyServerStreamRpcMetrics metrics;
+
+  public NettyServerStreamRpc(RaftServer server, TlsConf tlsConf) {
     this.name = server.getId() + "-" + JavaUtils.getClassSimpleName(getClass());
-    this.requests = new DataStreamManagement(server);
+    this.metrics = new NettyServerStreamRpcMetrics(this.name);
+    this.requests = new DataStreamManagement(server, metrics);
 
     final RaftProperties properties = server.getProperties();
 
@@ -126,13 +137,22 @@ public class NettyServerStreamRpc implements DataStreamServerRpc {
       this.proxies.add(new Proxies(new PeerProxyMap<>(name, peer -> newClient(peer, properties))));
     }
 
+    final boolean useEpoll = NettyConfigKeys.DataStream.Server.useEpoll(properties);
+    this.bossGroup = NettyUtils.newEventLoopGroup(name + "-bossGroup",
+        NettyConfigKeys.DataStream.Server.bossGroupSize(properties), useEpoll);
+    this.workerGroup = NettyUtils.newEventLoopGroup(name + "-workerGroup",
+        NettyConfigKeys.DataStream.Server.workerGroupSize(properties), useEpoll);
+
+    final SslContext sslContext = NettyUtils.buildSslContextForServer(tlsConf);
     final int port = NettyConfigKeys.DataStream.port(properties);
     this.channelFuture = new ServerBootstrap()
         .group(bossGroup, workerGroup)
-        .channel(NioServerSocketChannel.class)
+        .channel(bossGroup instanceof EpollEventLoopGroup ?
+            EpollServerSocketChannel.class : NioServerSocketChannel.class)
         .handler(new LoggingHandler(LogLevel.INFO))
-        .childHandler(getInitializer())
+        .childHandler(newChannelInitializer(sslContext))
         .childOption(ChannelOption.SO_KEEPALIVE, true)
+        .childOption(ChannelOption.TCP_NODELAY, true)
         .bind(port);
   }
 
@@ -146,9 +166,7 @@ public class NettyServerStreamRpc implements DataStreamServerRpc {
 
   @Override
   public void addRaftPeers(Collection<RaftPeer> newPeers) {
-    for (int i = 0; i < proxies.size(); i ++) {
-      proxies.get(i).addPeers(newPeers);
-    }
+    proxies.forEach(proxy -> proxy.addPeers(newPeers));
   }
 
   static class RequestRef {
@@ -177,6 +195,7 @@ public class NettyServerStreamRpc implements DataStreamServerRpc {
 
       @Override
       public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        metrics.onRequestCreate(NettyServerStreamRpcMetrics.RequestType.CHANNEL_READ);
         if (!(msg instanceof DataStreamRequestByteBuf)) {
           LOG.error("Unexpected message class {}, ignoring ...", msg.getClass().getName());
           return;
@@ -199,11 +218,14 @@ public class NettyServerStreamRpc implements DataStreamServerRpc {
     };
   }
 
-  private ChannelInitializer<SocketChannel> getInitializer(){
+  private ChannelInitializer<SocketChannel> newChannelInitializer(SslContext sslContext){
     return new ChannelInitializer<SocketChannel>(){
       @Override
       public void initChannel(SocketChannel ch) {
         ChannelPipeline p = ch.pipeline();
+        if (sslContext != null) {
+          p.addLast("ssl", sslContext.newHandler(ch.alloc()));
+        }
         p.addLast(newDecoder());
         p.addLast(newEncoder());
         p.addLast(newChannelInboundHandlerAdapter());
@@ -250,15 +272,15 @@ public class NettyServerStreamRpc implements DataStreamServerRpc {
       channelFuture.channel().close().sync();
       bossGroup.shutdownGracefully(0, 100, TimeUnit.MILLISECONDS);
       workerGroup.shutdownGracefully(0, 100, TimeUnit.MILLISECONDS);
-      bossGroup.awaitTermination(1000, TimeUnit.MILLISECONDS);
-      workerGroup.awaitTermination(1000, TimeUnit.MILLISECONDS);
+      ConcurrentUtils.shutdownAndWait(TimeDuration.ONE_SECOND, bossGroup,
+          timeout -> LOG.warn("{}: bossGroup shutdown timeout in " + timeout, this));
+      ConcurrentUtils.shutdownAndWait(TimeDuration.ONE_SECOND, workerGroup,
+          timeout -> LOG.warn("{}: workerGroup shutdown timeout in " + timeout, this));
     } catch (InterruptedException e) {
       LOG.error(this + ": Interrupted close()", e);
     }
 
-    for (int i = 0; i < proxies.size(); i ++) {
-      proxies.get(i).close();
-    }
+    proxies.forEach(Proxies::close);
   }
 
   @Override

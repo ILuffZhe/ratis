@@ -17,6 +17,7 @@
  */
 package org.apache.ratis.server.impl;
 
+import org.apache.ratis.proto.RaftProtos.RaftPeerRole;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.RaftConfiguration;
@@ -26,6 +27,7 @@ import org.apache.ratis.util.Preconditions;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -65,6 +67,10 @@ final class RaftConfigurationImpl implements RaftConfiguration {
       return setConf(new PeerConfiguration(peers));
     }
 
+    Builder setConf(Iterable<RaftPeer> peers, Iterable<RaftPeer> listeners) {
+      return setConf(new PeerConfiguration(peers, listeners));
+    }
+
     Builder setConf(RaftConfigurationImpl transitionalConf) {
       Objects.requireNonNull(transitionalConf);
       Preconditions.assertTrue(transitionalConf.isTransitional());
@@ -82,8 +88,8 @@ final class RaftConfigurationImpl implements RaftConfiguration {
       return this;
     }
 
-    Builder setOldConf(Iterable<RaftPeer> oldPeers) {
-      return setOldConf(new PeerConfiguration(oldPeers));
+    Builder setOldConf(Iterable<RaftPeer> oldPeers, Iterable<RaftPeer> oldListeners) {
+      return setOldConf(new PeerConfiguration(oldPeers, oldListeners));
     }
 
     Builder setOldConf(RaftConfigurationImpl stableConf) {
@@ -141,9 +147,16 @@ final class RaftConfigurationImpl implements RaftConfiguration {
     return oldConf == null;
   }
 
-  boolean containsInConf(RaftPeerId peerId) {
-    return conf.contains(peerId);
+  boolean containsInConf(RaftPeerId peerId, RaftPeerRole... roles) {
+    if (roles == null || roles.length == 0) {
+      return conf.contains(peerId);
+    } else if (roles.length == 1) {
+      return conf.contains(peerId, roles[0]);
+    } else {
+      return conf.contains(peerId, EnumSet.of(roles[0], roles)) != null;
+    }
   }
+
 
   boolean isHighestPriority(RaftPeerId peerId) {
     RaftPeer target = getPeer(peerId);
@@ -173,24 +186,25 @@ final class RaftConfigurationImpl implements RaftConfiguration {
   }
 
   @Override
-  public RaftPeer getPeer(RaftPeerId id) {
+  public RaftPeer getPeer(RaftPeerId id, RaftPeerRole... roles) {
     if (id == null) {
       return null;
     }
-    RaftPeer peer = conf.getPeer(id);
+    final RaftPeer peer = conf.getPeer(id, roles);
     if (peer != null) {
       return peer;
     } else if (oldConf != null) {
-      return oldConf.getPeer(id);
+      return oldConf.getPeer(id, roles);
     }
     return null;
   }
 
   @Override
-  public Collection<RaftPeer> getAllPeers() {
-    final Collection<RaftPeer> peers = new ArrayList<>(conf.getPeers());
+  public Collection<RaftPeer> getAllPeers(RaftPeerRole role) {
+    final Collection<RaftPeer> peers = new ArrayList<>(conf.getPeers(role));
     if (oldConf != null) {
-      oldConf.getPeers().stream().filter(p -> !peers.contains(p))
+      oldConf.getPeers(role).stream()
+          .filter(p -> !peers.contains(p))
           .forEach(peers::add);
     }
     return peers;
@@ -247,17 +261,19 @@ final class RaftConfigurationImpl implements RaftConfiguration {
 
   /** @return the peers which are not contained in conf. */
   Collection<RaftPeer> filterNotContainedInConf(List<RaftPeer> peers) {
-    return peers.stream().filter(p -> !containsInConf(p.getId())).collect(Collectors.toList());
+    return peers.stream()
+        .filter(p -> !containsInConf(p.getId(), RaftPeerRole.FOLLOWER, RaftPeerRole.LISTENER))
+        .collect(Collectors.toList());
   }
 
   @Override
-  public Collection<RaftPeer> getPreviousPeers() {
-    return oldConf != null ? oldConf.getPeers() : Collections.emptyList();
+  public Collection<RaftPeer> getPreviousPeers(RaftPeerRole role) {
+    return oldConf != null ? oldConf.getPeers(role) : Collections.emptyList();
   }
 
   @Override
-  public Collection<RaftPeer> getCurrentPeers() {
-    return conf.getPeers();
+  public Collection<RaftPeer> getCurrentPeers(RaftPeerRole role) {
+    return conf.getPeers(role);
   }
 
   @Override
